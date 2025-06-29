@@ -4,7 +4,7 @@ This project is a Webots robot controller for autonomous driving. It uses a deep
 
 ## 📦 Features
 
-- Uses **MobileNetV2** (modified final layer for 8 driving classes).
+- Uses **MobileNetV2** (modified final layer for 8 driving classes, check ipynb). 
 - Processes camera input in real-time inside Webots.
 - Predicts actions like `straight`, `left`, `right`, `stop`, etc.
 - Controls a simulated car using Webots `Driver` interface.
@@ -31,3 +31,10 @@ Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
+```
+
+
+Work on project:
+- Ilya Kolosov
+- Alexey Mamonov 
+- Alexander Bratsev
