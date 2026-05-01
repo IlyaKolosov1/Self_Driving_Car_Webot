@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.DS_Store
+
+# Webots generated local project/preview files
+*.wbproj
+Webots_auto_car_11/worlds/.*.jpg
