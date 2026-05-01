@@ -1,187 +1,144 @@
 """main controller."""
 
 from vehicle import Driver
-from controller import Camera, Keyboard, Emitter, Lidar
+from controller import Lidar
 import cv2
 import numpy as np
-import struct
 import torch
 import torch.nn as nn
-from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+import time
+from torchvision.models import mobilenet_v2
 
-# ===== 1. Подготовка модели (MobileNetV2 без предобученных весов) =====
+INPUT_SIZE = (224, 224)
+INFERENCE_PERIOD_STEPS = 4  # 1 = на каждом шаге, больше = быстрее, но менее отзывчиво
+PRINT_EVERY_N_INFERENCES = 0  # 0 = без логов
+PROFILE_EVERY_N_INFERENCES = 0  # 0 = профайлинг выключен
+MAX_STEERING_RAD = 0.35  # более реалистичный предел для передних колес
+STEERING_SMOOTHING = 0.25  # 0..1, больше = резче реакция
+STEERING_CENTERING_SMOOTHING = 0.12  # плавный возврат к 0, если класс без руления
+STEERING_SIGN = 1.0  # поменяйте на -1.0, если лево/право инвертированы
+MAX_CRUISING_SPEED = 18.0  # м/с, поднят лимит скорости
+SPEED_SCALE = 1.6  # общий множитель скорости (быстрый тюнинг)
 
-# 1. Создаём MobileNetV2 без предобученных весов
+
+def sanitize_steering_angle(value, assume_degrees=False, scale=1.0):
+    """Normalize steering command to safe radians range."""
+    value = float(value) * float(scale)
+    if assume_degrees:
+        value = np.deg2rad(value)
+    return float(np.clip(value, -MAX_STEERING_RAD, MAX_STEERING_RAD))
+
+# ===== 1. Подготовка модели =====
+if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+
 model = mobilenet_v2(weights=None)
-
-# 2. Меняем последний слой под свои классы
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 model.classifier[1] = nn.Linear(model.last_channel, 8)
-
 model.load_state_dict(torch.load("mobilenet8_best.pth", map_location=device))
-
-
-# Переносим на устройство (GPU или CPU)
 model = model.to(device)
-
-# Переключаем в режим inference
 model.eval()
 
+mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-# ===== 2. Подготовка контроллера Webots =====
-
-print("=== Запуск контроллера ===")
-driver = Driver()  # Объект Driver для управления машиной
-timestep = int(driver.getBasicTimeStep())
-
-# Скорость и угол по умолчанию
-crusingSpeed = 0.0
-streeringAngle = 0.0
-
-# Получаем устройства
-camera = driver.getDevice("camera")
-camera.enable(timestep)
-
-emitter = driver.getDevice("emitter")
-# — если захочешь что-то пересылать другим контроллерам, можно раскомментировать:
-# emitter.enable(timestep)
-
-keyboard = Keyboard()
-keyboard.enable(timestep)
-
-lms291 = driver.getDevice("Sick LMS 291")
-Lidar.enable(lms291, timestep)
-
-# Простая карта классов (индекс → строка)
 class_names = {
     0: "straight",
     1: "left",
     2: "right",
     3: "RezkiyLeft",
-    4: "RezkiyRight", 
+    4: "RezkiyRight",
     5: "stop",
     6: "slow",
-    7: "speed_up"
+    7: "speed_up",
 }
 
+control_by_class = {
+    "straight": (8.0, 0.0),
+    "left": (7.0, -0.15),
+    "right": (7.0, 0.15),
+    "RezkiyLeft": (5.0, -0.35),
+    "RezkiyRight": (5.0, 0.35),
+    "stop": (0.0, 0.0),
+    "slow": (4.0, None),
+    "speed_up": (11.0, None),
+}
 
+# ===== 2. Подготовка контроллера Webots =====
+driver = Driver()
+timestep = int(driver.getBasicTimeStep())
+
+camera = driver.getDevice("camera")
+camera.enable(timestep)
+
+lms291 = driver.getDevice("Sick LMS 291")
+Lidar.enable(lms291, timestep)
+
+crusingSpeed = 0.0
+streeringAngle = 0.0
+predicted_label = "straight"
+step_count = 0
+inference_count = 0
 
 # ===== 3. Основной цикл =====
-
 while driver.step() != -1:
-    # -------------------------------
-    # A. Получаем кадр с камеры Webots
-    # -------------------------------
-    image = camera.getImageArray()  # сразу получаем массив [H][W][3], dtype=uint8
+    step_count += 1
+    if step_count % INFERENCE_PERIOD_STEPS == 0:
+        image = camera.getImageArray()
+        if image is not None:
+            # Меньше копирований и операций в горячем пути.
+            t0 = time.perf_counter()
+            img_np = np.asarray(image, dtype=np.uint8)
+            img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+            img_resized = cv2.resize(img_rgb, INPUT_SIZE, interpolation=cv2.INTER_AREA)
 
-    if image is not None:
-        # Конвертируем в numpy-формат (shape [H, W, 3], BGR → RGB)
-        img_np = np.array(image, dtype=np.uint8)  # форма (H, W, 3)
+            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0)
+            img_tensor = img_tensor.to(device=device, dtype=torch.float32).div_(255.0)
+            img_tensor.sub_(mean).div_(std)
+            t1 = time.perf_counter()
 
-        # Webots возвращает изображение в формате BGR (uint8).
-        # Если вдруг это RGBA, можно взять [:, :, :3].
-        # Но getImageArray() обычно уже выдаёт только 3 канала.
+            with torch.inference_mode():
+                output = model(img_tensor)
+                predicted_class = int(torch.argmax(output, dim=1).item())
+                predicted_label = class_names[predicted_class]
+            t2 = time.perf_counter()
 
-        # 1) Переводим BGR → RGB
-        img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+            inference_count += 1
+            if PRINT_EVERY_N_INFERENCES > 0:
+                if inference_count % PRINT_EVERY_N_INFERENCES == 0:
+                    print(f"Predicted class: {predicted_class} -> {predicted_label}")
+            if PROFILE_EVERY_N_INFERENCES > 0:
+                if inference_count % PROFILE_EVERY_N_INFERENCES == 0:
+                    prep_ms = (t1 - t0) * 1000.0
+                    infer_ms = (t2 - t1) * 1000.0
+                    total_ms = (t2 - t0) * 1000.0
+                    print(
+                        f"[profile] prep={prep_ms:.1f}ms infer={infer_ms:.1f}ms total={total_ms:.1f}ms device={device.type}"
+                    )
 
-        # 2) Меняем размер на 224×224 (нужно для MobileNetV2)
-        img_resized = cv2.resize(img_rgb, (224, 224))
-        
-        
+    new_speed, new_steering = control_by_class[predicted_label]
+    crusingSpeed = new_speed * SPEED_SCALE
+    if new_steering is not None:
+        target_steering = sanitize_steering_angle(new_steering * STEERING_SIGN)
+        streeringAngle = (
+            (1.0 - STEERING_SMOOTHING) * streeringAngle
+            + STEERING_SMOOTHING * target_steering
+        )
+    else:
+        # Для классов без явного поворота руль постепенно возвращается в центр.
+        streeringAngle = (
+            (1.0 - STEERING_CENTERING_SMOOTHING) * streeringAngle
+            + STEERING_CENTERING_SMOOTHING * 0.0
+        )
 
-
-        
-        # 3) Превращаем в тензор [C, H, W] и нормализуем в [0,1]
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0  # shape [3,224,224]
-
-        # 4) Нормализация как для ImageNet
-        mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
-        std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
-        img_tensor = (img_tensor - mean) / std
-
-        # 5) Добавляем batch-координату → shape [1, 3, 224, 224]
-        img_tensor = img_tensor.unsqueeze(0).to(device)
-
-        # -------------------------------
-        # B. Делаем предсказание
-        # -------------------------------
-        with torch.no_grad():
-            output = model(img_tensor)                     # shape [1, 6]
-            predicted_class = torch.argmax(output, dim=1).item()
-            predicted_label = class_names[predicted_class]
-            # Печатаем в консоль (см. окно Webots)
-            print(f"Predicted class: {predicted_class} → {predicted_label}")
-
-        # -------------------------------
-        # C. Применяем логику управления
-        # -------------------------------
-        # В зависимости от predicted_label меняем crusingSpeed и streeringAngle
-        if predicted_label == "straight":
-            crusingSpeed = 5.0
-            streeringAngle = 0.0
-        elif predicted_label == "left":
-            crusingSpeed = 5.0
-            streeringAngle = -0.15
-        elif predicted_label == "right":
-            crusingSpeed = 5.0
-            streeringAngle = 0.15
-        elif predicted_label == "RezkiyLeft":
-            crusingSpeed = 3.5
-            streeringAngle = -0.55
-        elif predicted_label == "RezkiyRight":
-            crusingSpeed = 3.5
-            streeringAngle = 0.55
-        elif predicted_label == "stop":
-            crusingSpeed = 0.0
-            # стерееринг можно оставить прежним или выставить 0
-        elif predicted_label == "slow":
-            crusingSpeed = 2.5
-        elif predicted_label == "speed_up":
-            crusingSpeed = 7.0
-
-        # Ограничим разумные границы (на случай overflow)
-        crusingSpeed = max(0.0, min(crusingSpeed, 10.0))       # от 0 до 10 м/с
-        streeringAngle = max(-0.5, min(streeringAngle, 0.5))  # от -0.5 до 0.5 радиан
-
-        # Применяем к Driver
-        driver.setCruisingSpeed(crusingSpeed)
-        driver.setSteeringAngle(streeringAngle)
-
-
-        # -------------------------------
-        # D. (Опционально) Отправка по Emitter
-        # -------------------------------
-        # Например, передаём строковую метку другим контроллерам
-        # emitter.send(predicted_label.encode())
-        # (Приём у другого контроллера: receiver.getData().decode())
-        pass
-
-    # -------------------------------
-    # E. Обработка клавиатуры (по желанию)
-    # -------------------------------
-    # Если хочешь оставить ручное управление вместо ИИ, можно раскомментировать:
-    """
-    key = keyboard.getKey()
-    if key == Keyboard.UP:
-        crusingSpeed += 0.5
-    elif key == Keyboard.DOWN:
-        crusingSpeed -= 0.5
-    elif key == Keyboard.LEFT:
-        streeringAngle -= 0.01
-    elif key == Keyboard.RIGHT:
-        streeringAngle += 0.01
-    elif key == ord("S"):
-        crusingSpeed = 0.0
-    elif key == ord("D"):
-        streeringAngle = 0.0
-
-    crusingSpeed = max(0.0, min(crusingSpeed, 10.0))
-    streeringAngle = max(-0.5, min(streeringAngle, 0.5))
+    crusingSpeed = max(0.0, min(crusingSpeed, MAX_CRUISING_SPEED))
+    streeringAngle = float(np.clip(streeringAngle, -MAX_STEERING_RAD, MAX_STEERING_RAD))
 
     driver.setCruisingSpeed(crusingSpeed)
     driver.setSteeringAngle(streeringAngle)
-    """
-
-# — конец цикла, Webots закончил симуляцию —
