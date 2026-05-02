@@ -2,6 +2,13 @@
 
 This project is a Webots robot controller for autonomous driving. It uses a deep learning model (MobileNetV2) to predict driving actions from camera input in real time.
 
+## 🎬 Demo GIFs
+
+- `overview.gif`
+
+![Overview](assets/readme-gifs/overview.gif)
+
+
 ## 📦 Features
 
 - Uses **MobileNetV2** (modified final layer for 8 driving classes, check ipynb). 
@@ -38,3 +45,6 @@ Work on project:
 - Ilya Kolosov
 - Alexey Mamonov 
 - Alexander Bratsev
+
+> Note: Work is currently in progress to modernize the control pipeline and make the vehicle behavior more stable and realistic.  
+> We are also expanding the driving scenarios to support more complex and less predictable road situations.
